@@ -19,6 +19,7 @@ class Stream:
     session_id: int = 0
     ptp_gmid: str = "00-00-00-00-00-00-00-00"
     ptp_domain: int = 0
+    version: int = 0
 
     @property
     def frames_per_packet(self) -> int:
@@ -28,7 +29,7 @@ class Stream:
 def build(s: Stream) -> str:
     lines = [
         "v=0",
-        f"o=- {s.session_id} 0 IN IP4 {s.origin_ip}",
+        f"o=- {s.session_id} {s.version} IN IP4 {s.origin_ip}",
         f"s={s.name}",
         f"c=IN IP4 {s.address}/32",
         "t=0 0",

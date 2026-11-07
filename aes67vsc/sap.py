@@ -39,24 +39,38 @@ class Announcer:
     """Re-announces a stream every `interval` seconds, sends a deletion on stop."""
 
     def __init__(self, stream: sdp.Stream, iface_ip: str, interval: float = 5.0):
-        self.sdp_text = sdp.build(stream)
+        self.stream = stream
         self.iface_ip = iface_ip
         self.interval = interval
         self.sock = multicast_tx(iface_ip, ttl=15)
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
+
+    @property
+    def sdp_text(self) -> str:
+        return sdp.build(self.stream)
 
     def start(self):
         self._thread.start()
 
+    def refresh(self):
+        """Stream description changed (e.g. new PTP grandmaster): re-announce now."""
+        self.stream.version += 1
+        self._wake.set()
+
     def _run(self):
-        pkt = build(self.sdp_text, self.iface_ip)
         while not self._stop.is_set():
-            self.sock.sendto(pkt, (SAP_GROUP, SAP_PORT))
-            self._stop.wait(self.interval)
+            try:
+                self.sock.sendto(build(self.sdp_text, self.iface_ip), (SAP_GROUP, SAP_PORT))
+            except OSError:
+                pass
+            self._wake.wait(self.interval)
+            self._wake.clear()
 
     def stop(self):
         self._stop.set()
+        self._wake.set()
         try:
             self.sock.sendto(build(self.sdp_text, self.iface_ip, delete=True), (SAP_GROUP, SAP_PORT))
         except OSError:

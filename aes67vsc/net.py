@@ -1,5 +1,6 @@
 """Socket helpers."""
 import socket
+import sys
 import struct
 
 
@@ -25,7 +26,11 @@ def multicast_rx(group: str, port: int, iface_ip: str) -> socket.socket:
         except OSError:
             pass
     s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
-    s.bind(("", port))  # Windows can't bind to a multicast address; "" works everywhere
+    # Bind to the group on POSIX so sockets on the same port only get their own group.
+    # Windows can't bind to a multicast address, but already filters by membership.
+    s.bind(("" if sys.platform == "win32" else group, port))
+    if sys.platform.startswith("linux"):
+        s.setsockopt(socket.IPPROTO_IP, 49, 0)  # IP_MULTICAST_ALL = 0
     mreq = struct.pack("4s4s", socket.inet_aton(group), socket.inet_aton(iface_ip))
     s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
     return s

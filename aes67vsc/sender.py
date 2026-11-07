@@ -7,11 +7,11 @@ import time
 
 from . import rtp, sap, sdp
 from .net import multicast_tx
-from .ptp import Follower
+from .ptp import Clock
 
 
 class Sender:
-    def __init__(self, stream: sdp.Stream, source, clock: Follower, iface_ip: str):
+    def __init__(self, stream: sdp.Stream, source, clock: Clock, iface_ip: str):
         self.stream, self.source, self.clock = stream, source, clock
         self.sock = multicast_tx(iface_ip, ttl=15)
         self.ssrc = random.getrandbits(32)
@@ -20,8 +20,16 @@ class Sender:
         self._stop = threading.Event()
         self.announcer = sap.Announcer(stream, iface_ip)
         self._thread = threading.Thread(target=self._run, daemon=True)
+        clock.on_change(self._clock_changed)
+
+    def _clock_changed(self):
+        if self.clock.gm_id and self.clock.gm_id != self.stream.ptp_gmid:
+            self.stream.ptp_gmid = self.clock.gm_id
+            self.announcer.refresh()
 
     def start(self):
+        if self.clock.gm_id:
+            self.stream.ptp_gmid = self.clock.gm_id
         self.announcer.start()
         self._thread.start()
 

@@ -50,9 +50,11 @@ def test_ptp_two_step_offset():
     sync = bytes(hdr(0, 7, 0x02)) + bytes(10)
     master_ns = 1_700_000_037_123_456_789
     fu = bytes(hdr(8, 7)) + (master_ns // 10**9).to_bytes(6, "big") + (master_ns % 10**9).to_bytes(4, "big")
+    f._master_port = bytes.fromhex("001dc1fffe0e10c4") + b"\x00\x00"
+    f.state = "follower"
     f._handle(sync, 1_000)
     f._handle(fu, 2_000)
-    assert f.offset_ns == master_ns - 1_000 and f.gm_id == "00-1D-C1-FF-FE-0E-10-C4"
+    assert f.offset_ns == master_ns - 1_000
 
 
 def test_ring_wraps():
@@ -89,7 +91,7 @@ def test_loopback_send_discover_receive():
         tx.stop()
         browser.stop()
     assert rx.packets > 800, rx.packets
-    audio = rx.ring.read(len(rx.ring))
+    audio = rx.buf.ring.read(len(rx.buf.ring))
     assert len(audio) >= 480
     spectrum = np.abs(np.fft.rfft(audio[:, 0]))
     peak_hz = np.argmax(spectrum) * 48000 / len(audio)

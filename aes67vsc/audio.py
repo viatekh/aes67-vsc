@@ -77,26 +77,15 @@ class DeviceSource:
     """Captures from a sound card. Pads with silence / drops to absorb clock drift."""
 
     def __init__(self, channels: int, rate: int, device=None, target_ms: float = 20):
-        self.ring = Ring(channels, rate)
-        self.target = int(rate * target_ms / 1000)
-        self.primed = False
+        from .elastic import ElasticBuffer
+        self.buf = ElasticBuffer(channels, rate, int(rate * target_ms / 1000))
         self.stream = _sd().InputStream(samplerate=rate, channels=channels, dtype="float32",
                                         device=device, latency="low",
-                                        callback=lambda d, f, t, s: self.ring.write(d))
+                                        callback=lambda d, f, t, s: self.buf.write(d.copy()))
         self.stream.start()
 
     def read(self, n: int) -> np.ndarray:
-        if not self.primed:
-            if len(self.ring) < self.target:
-                return np.zeros((n, self.ring.buf.shape[1]), np.float32)
-            self.primed = True
-        if len(self.ring) > 3 * self.target:  # card clock faster than network clock
-            self.ring.drop(len(self.ring) - self.target)
-        x = self.ring.read(n)
-        if len(x) < n:  # underrun: card slower than network clock
-            self.primed = False
-            x = np.vstack([x, np.zeros((n - len(x), x.shape[1]), np.float32)])
-        return x
+        return self.buf.read(n)
 
     def close(self):
         self.stream.stop()
@@ -104,25 +93,15 @@ class DeviceSource:
 
 
 class DeviceSink:
-    """Plays a Ring; waits until `target` frames are buffered before (re)starting."""
+    """Plays an ElasticBuffer on a sound card."""
 
-    def __init__(self, ring: Ring, rate: int, target: int, device=None):
-        self.ring = ring
-        ch = ring.buf.shape[1]
-        primed = [False]
+    def __init__(self, buf, rate: int, device=None):
+        self.buf = buf
 
         def cb(out, frames, t, status):
-            if not primed[0] and len(ring) < target + frames:
-                out[:] = 0
-                return
-            primed[0] = True
-            x = ring.read(frames)
-            if len(x) < frames:
-                primed[0] = False
-            out[:len(x)] = x
-            out[len(x):] = 0
+            out[:] = buf.read(frames)
 
-        self.stream = _sd().OutputStream(samplerate=rate, channels=ch, dtype="float32",
+        self.stream = _sd().OutputStream(samplerate=rate, channels=buf.channels, dtype="float32",
                                          device=device, latency="low", callback=cb)
         self.stream.start()
 
