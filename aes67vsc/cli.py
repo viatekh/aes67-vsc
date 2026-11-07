@@ -39,12 +39,17 @@ def cmd_interfaces(args):
 
 def cmd_list(args):
     ip = _ip(args)
-    print(f"Listening for AES67 (SAP) streams on {ip} for {args.time:g}s (Ctrl+C to stop)...")
+    print(f"Listening for AES67 streams (SAP + RAVENNA) on {ip} for {args.time:g}s (Ctrl+C to stop)...")
     b = sap.Browser(ip).start()
+    try:
+        from .ravenna import Ravenna
+        rav = Ravenna(ip)
+    except Exception:  # noqa: BLE001
+        rav = None
     seen, end = [], time.monotonic() + args.time
     try:
         while time.monotonic() < end:
-            for s in b.list():
+            for s in b.list() + (rav.list() if rav else []):
                 if s not in seen:
                     seen.append(s)
                     print(f"  {s.name!r}  {s.address}:{s.port}  {s.encoding}/{s.rate}/{s.channels}ch "
@@ -53,6 +58,8 @@ def cmd_list(args):
     except KeyboardInterrupt:
         pass
     b.stop()
+    if rav:
+        rav.close()
     if not seen:
         print("No streams found. In Dante Controller: enable AES67 mode on the device, "
               "then create an AES67 multicast transmit flow.")

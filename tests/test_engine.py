@@ -27,3 +27,24 @@ def test_two_streams_isolated_and_autoconnect():
         assert rx["iso A"].lost == 0 and rx["iso B"].lost == 0
     finally:
         eng.stop()
+
+
+def test_ravenna_only_discovery():
+    """Receiver finds a stream that is advertised only via RAVENNA (no SAP)."""
+    from aes67vsc.net import default_interface_ip
+    from aes67vsc.ravenna import Ravenna
+    from aes67vsc import sdp
+    ip = default_interface_ip()
+    a = Ravenna(ip)
+    a.advertise(sdp.Stream("rav only", "239.69.9.9", 5004, origin_ip=ip, session_id=5))
+    eng = Engine(Config(interface=ip, ptp_can_lead=False, nmos=False), log=lambda *x: None)
+    eng.start()
+    try:
+        for _ in range(30):
+            if any(s.name == "rav only" for s in eng.discovered()):
+                break
+            time.sleep(0.2)
+        assert any(s.name == "rav only" and s.address == "239.69.9.9" for s in eng.discovered())
+    finally:
+        eng.stop()
+        a.close()
