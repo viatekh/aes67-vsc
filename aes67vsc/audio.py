@@ -1,0 +1,131 @@
+"""Audio sources/sinks: sound card (via PortAudio) or test tone / null."""
+from __future__ import annotations
+
+import threading
+
+import numpy as np
+
+
+class Ring:
+    """Thread-safe FIFO of float32 frames."""
+
+    def __init__(self, channels: int, capacity: int):
+        self.buf = np.zeros((capacity, channels), np.float32)
+        self.cap, self.r, self.n = capacity, 0, 0
+        self.lock = threading.Lock()
+
+    def __len__(self):
+        return self.n
+
+    def write(self, x: np.ndarray):
+        with self.lock:
+            if len(x) > self.cap:
+                x = x[-self.cap:]
+            over = self.n + len(x) - self.cap
+            if over > 0:  # drop oldest
+                self.r = (self.r + over) % self.cap
+                self.n -= over
+            w = (self.r + self.n) % self.cap
+            k = min(len(x), self.cap - w)
+            self.buf[w:w + k] = x[:k]
+            self.buf[:len(x) - k] = x[k:]
+            self.n += len(x)
+
+    def read(self, count: int) -> np.ndarray:
+        with self.lock:
+            k = min(count, self.n)
+            idx = (self.r + np.arange(k)) % self.cap
+            out = self.buf[idx]
+            self.r = (self.r + k) % self.cap
+            self.n -= k
+            return out
+
+    def drop(self, count: int):
+        with self.lock:
+            count = min(count, self.n)
+            self.r = (self.r + count) % self.cap
+            self.n -= count
+
+
+def _sd():
+    try:
+        import sounddevice
+        return sounddevice
+    except OSError as e:  # PortAudio library missing
+        raise SystemExit(f"Sound card access unavailable ({e}). On Linux: sudo apt install libportaudio2")
+
+
+def list_devices() -> str:
+    return str(_sd().query_devices())
+
+
+class ToneSource:
+    def __init__(self, channels: int, rate: int, freq: float = 440.0, level: float = 0.25):
+        self.channels, self.rate, self.freq, self.level, self.phase = channels, rate, freq, level, 0
+
+    def read(self, n: int) -> np.ndarray:
+        t = (self.phase + np.arange(n)) / self.rate
+        self.phase += n
+        x = (self.level * np.sin(2 * np.pi * self.freq * t)).astype(np.float32)
+        return np.repeat(x[:, None], self.channels, axis=1)
+
+    def close(self):
+        pass
+
+
+class DeviceSource:
+    """Captures from a sound card. Pads with silence / drops to absorb clock drift."""
+
+    def __init__(self, channels: int, rate: int, device=None, target_ms: float = 20):
+        self.ring = Ring(channels, rate)
+        self.target = int(rate * target_ms / 1000)
+        self.primed = False
+        self.stream = _sd().InputStream(samplerate=rate, channels=channels, dtype="float32",
+                                        device=device, latency="low",
+                                        callback=lambda d, f, t, s: self.ring.write(d))
+        self.stream.start()
+
+    def read(self, n: int) -> np.ndarray:
+        if not self.primed:
+            if len(self.ring) < self.target:
+                return np.zeros((n, self.ring.buf.shape[1]), np.float32)
+            self.primed = True
+        if len(self.ring) > 3 * self.target:  # card clock faster than network clock
+            self.ring.drop(len(self.ring) - self.target)
+        x = self.ring.read(n)
+        if len(x) < n:  # underrun: card slower than network clock
+            self.primed = False
+            x = np.vstack([x, np.zeros((n - len(x), x.shape[1]), np.float32)])
+        return x
+
+    def close(self):
+        self.stream.stop()
+        self.stream.close()
+
+
+class DeviceSink:
+    """Plays a Ring; waits until `target` frames are buffered before (re)starting."""
+
+    def __init__(self, ring: Ring, rate: int, target: int, device=None):
+        self.ring = ring
+        ch = ring.buf.shape[1]
+        primed = [False]
+
+        def cb(out, frames, t, status):
+            if not primed[0] and len(ring) < target + frames:
+                out[:] = 0
+                return
+            primed[0] = True
+            x = ring.read(frames)
+            if len(x) < frames:
+                primed[0] = False
+            out[:len(x)] = x
+            out[len(x):] = 0
+
+        self.stream = _sd().OutputStream(samplerate=rate, channels=ch, dtype="float32",
+                                         device=device, latency="low", callback=cb)
+        self.stream.start()
+
+    def close(self):
+        self.stream.stop()
+        self.stream.close()
