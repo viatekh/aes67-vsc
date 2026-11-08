@@ -1,12 +1,12 @@
 # aes67-vsc — AES67 + Dante virtual soundcard
 
 A plug-and-play network sound card for Windows, macOS and Linux. It works with:
-- **Dante** devices (in AES67 mode)
+- **Dante** devices, natively (experimental) or via their AES67 mode
 - **RAVENNA** gear (Merging, Lawo, DirectOut, Neumann…)
 - **NMOS** broadcast controllers
 - any other AES67 device
 
-No Audinate license is needed, because it uses the open AES67 standard.
+No Audinate license is needed: it uses the open AES67 standard, plus an optional unofficial native Dante mode.
 
 ## Install
 Download the installer for your OS from the Releases page:
