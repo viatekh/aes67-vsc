@@ -3,7 +3,7 @@ name = "aes67-vsc"
 version = "0.1.0"
 description = "Basic AES67 virtual soundcard (Dante-compatible via AES67 mode)"
 requires-python = ">=3.9"
-dependencies = ["numpy", "sounddevice", "psutil", "zeroconf"]
+dependencies = ["numpy", "sounddevice", "psutil", "zeroconf", "pystray", "pillow"]
 
 [project.scripts]
 aes67-vsc = "aes67vsc.cli:main"
@@ -11,3 +11,6 @@ aes67-vsc = "aes67vsc.cli:main"
 [build-system]
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-data]
+aes67vsc = ["ui.html"]

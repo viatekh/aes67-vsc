@@ -29,7 +29,10 @@ def _run(cfg: Config):
 
 def cmd_devices(args):
     from .audio import list_devices
-    print(list_devices())
+    try:
+        print(list_devices())
+    except RuntimeError as e:
+        sys.exit(str(e))
 
 
 def cmd_interfaces(args):
@@ -102,13 +105,37 @@ def cmd_config(args):
     print(path.read_text())
 
 
+def cmd_app(args):
+    from .ui import run_app
+    run_app(background=args.background, tray=not args.no_tray)
+
+
+def cmd_setup(args):
+    from . import system
+    if not system.is_admin():
+        print("Run this as administrator (Windows) or with sudo (Linux/macOS).")
+    ok = system.setup()
+    if args.autostart:
+        system.set_autostart(True)
+    print("Setup complete." if ok else "Setup finished with errors (see above).")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="aes67-vsc", description="AES67 virtual soundcard "
                                 "(plug-and-play with Dante gear in AES67 mode).")
     p.add_argument("-i", "--interface", default=None, help="interface IP (default: auto-detect)")
     p.add_argument("--ptp-domain", type=int, default=0)
     p.add_argument("--no-lead", action="store_true", help="never act as PTP clock leader")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd")
+
+    q = sub.add_parser("app", help="tray icon + control panel (default when run with no command)")
+    q.add_argument("--background", action="store_true", help="don't open the browser")
+    q.add_argument("--no-tray", action="store_true")
+    q.set_defaults(fn=cmd_app)
+
+    q = sub.add_parser("setup", help="one-time admin setup: firewall rules, PTP permission")
+    q.add_argument("--autostart", action="store_true", help="also start at login")
+    q.set_defaults(fn=cmd_setup)
 
     sub.add_parser("devices", help="list sound cards").set_defaults(fn=cmd_devices)
     sub.add_parser("interfaces", help="show network interface auto-detection").set_defaults(fn=cmd_interfaces)
@@ -141,7 +168,7 @@ def main(argv=None):
     q.add_argument("--ptime", type=float, default=1.0)
     q.set_defaults(fn=cmd_send)
 
-    args = p.parse_args(argv)
+    args = p.parse_args(argv if argv is not None else (sys.argv[1:] or ["app"]))
     if getattr(args, "device", None) is not None and str(args.device).isdigit():
         args.device = int(args.device)
     if getattr(args, "name", "") is None:

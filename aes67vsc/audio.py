@@ -52,7 +52,7 @@ def _sd():
         import sounddevice
         return sounddevice
     except OSError as e:  # PortAudio library missing
-        raise SystemExit(f"Sound card access unavailable ({e}). On Linux: sudo apt install libportaudio2")
+        raise RuntimeError(f"sound card access unavailable ({e}). On Linux: sudo apt install libportaudio2") from e
 
 
 def list_devices() -> str:

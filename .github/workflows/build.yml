@@ -1,0 +1,56 @@
+name: build
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e . pytest
+      - run: pytest -q tests
+  package:
+    needs: test
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+      - run: pip install -e . pyinstaller
+      - run: pyinstaller --noconfirm --distpath dist --workpath build packaging/aes67-vsc.spec
+      - name: Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $env:APP_VERSION = "${{ github.ref_name }}"
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\windows.iss /Odist
+      - name: macOS dmg
+        if: runner.os == 'macOS'
+        run: hdiutil create -volname "AES67 Virtual Soundcard" -srcfolder "dist/AES67 Virtual Soundcard.app" -ov -format UDZO dist/aes67-vsc-macos.dmg
+      - name: Linux tarball
+        if: runner.os == 'Linux'
+        run: cp packaging/install-linux.sh dist/ && tar -C dist -czf dist/aes67-vsc-linux.tar.gz aes67-vsc install-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aes67-vsc-${{ runner.os }}
+          path: |
+            dist/aes67-vsc-setup.exe
+            dist/aes67-vsc-macos.dmg
+            dist/aes67-vsc-linux.tar.gz
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/aes67-vsc-setup.exe
+            dist/aes67-vsc-macos.dmg
+            dist/aes67-vsc-linux.tar.gz

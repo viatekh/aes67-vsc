@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AES67 Virtual Soundcard</title>
+<style>
+:root{--bg:#f5f6f8;--card:#fff;--fg:#1b1f24;--mut:#667085;--line:#e3e6ea;--acc:#2060c8;--ok:#1a7f37;--warn:#b35900;--bad:#c62828}
+@media (prefers-color-scheme:dark){:root{--bg:#121417;--card:#1b1e23;--fg:#e8eaed;--mut:#9aa3ad;--line:#2c3138;--acc:#6ea0ff;--ok:#4cc26a;--warn:#f0a040;--bad:#ff6b6b}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:980px;margin:0 auto;padding:20px 16px 60px}
+h1{font-size:20px;margin:0 0 4px}h2{font-size:15px;margin:0 0 10px;display:flex;justify-content:space-between;align-items:center}
+.sub{color:var(--mut);margin-bottom:18px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:14px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 0;border-top:1px solid var(--line)}
+.row:first-of-type{border-top:0}
+input,select{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit;min-width:0}
+input[type=number]{width:72px}.grow{flex:1 1 180px}
+button{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:7px 12px;font:inherit;cursor:pointer}
+button.ghost{background:transparent;color:var(--acc);border:1px solid var(--line)}button.x{background:transparent;color:var(--bad);padding:4px 8px}
+.pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:12px;border:1px solid var(--line)}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.mut{color:var(--mut)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
+.kv b{display:block;font-size:12px;color:var(--mut);font-weight:500}
+pre{margin:0;max-height:180px;overflow:auto;font-size:12px;color:var(--mut);white-space:pre-wrap}
+.bar{position:sticky;bottom:12px;display:none;justify-content:flex-end;gap:8px}.bar.show{display:flex}
+.bar div{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px;display:flex;gap:8px;align-items:center;box-shadow:0 4px 16px #0003}
+table{width:100%;border-collapse:collapse}td{padding:6px 4px;border-top:1px solid var(--line)}tr:first-child td{border-top:0}
+</style>
+</head>
+<body>
+<main>
+  <h1>AES67 Virtual Soundcard</h1>
+  <div class="sub">Works with Dante (AES67 mode), RAVENNA, NMOS and other AES67 devices.</div>
+
+  <section class="card"><h2>Status</h2>
+    <div class="grid">
+      <div class="kv"><b>Network</b><span id="iface">…</span></div>
+      <div class="kv"><b>Clock (PTP)</b><span id="ptp">…</span></div>
+      <div class="kv"><b>NMOS</b><span id="nmos" class="mut">…</span></div>
+    </div>
+    <div id="alerts"></div>
+  </section>
+
+  <section class="card"><h2>Send to network <button class="ghost" onclick="addSend()">+ Add</button></h2>
+    <div id="sends"></div></section>
+
+  <section class="card"><h2>Receive from network <button class="ghost" onclick="addRecv()">+ Add</button></h2>
+    <div id="recvs"></div></section>
+
+  <section class="card"><h2>Streams on the network</h2><table id="streams"></table></section>
+
+  <section class="card"><h2>Settings</h2>
+    <div class="row"><label class="grow">Network interface</label>
+      <input id="ifaceIn" placeholder="auto" oninput="dirty()"></div>
+    <div class="row"><label class="grow">Allow this computer to be the clock leader when no other device is</label>
+      <input type="checkbox" id="canLead" onchange="dirty()"></div>
+    <div class="row"><label class="grow">Discover RAVENNA devices / act as NMOS node</label>
+      <input type="checkbox" id="rav" onchange="dirty()"> <input type="checkbox" id="nmosIn" onchange="dirty()"></div>
+    <div class="row"><label class="grow">Start at login</label>
+      <input type="checkbox" id="auto" onchange="post({autostart:this.checked})"></div>
+    <div class="row"><label class="grow">Firewall &amp; permissions (needs admin)</label>
+      <button class="ghost" onclick="setup()">Run setup</button></div>
+  </section>
+
+  <section class="card"><h2>Log</h2><pre id="log"></pre></section>
+  <div class="bar" id="bar"><div><span>Unsaved changes</span><button class="ghost" onclick="cfg=null;isDirty=false;bar()">Discard</button><button onclick="save()">Apply</button></div></div>
+</main>
+<script>
+let S = null, cfg = null, isDirty = false, devs = [];
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+function dirty(){ isDirty = true; bar(); }
+function bar(){ $("bar").classList.toggle("show", isDirty); if(!isDirty) render(); }
+async function post(o){ const r = await fetch("/api/apply",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(o)}); return r.json(); }
+async function setup(){ const r = await post({setup:true}); alert(r.ok ? "Done." : "Some steps failed — run the app as administrator once, then try again. See the log."); }
+function devOpts(kind, sel){
+  const list = devs.filter(d => kind === "in" ? d.in > 0 : d.out > 0);
+  return `<option value="">System default</option>` + list.map(d => `<option value="${esc(d.name)}" ${d.name === sel ? "selected" : ""}>${esc(d.name)}</option>`).join("");
+}
+function render(){
+  if(!S) return;
+  if(!isDirty) cfg = JSON.parse(JSON.stringify(S.config));
+  $("iface").textContent = S.interface || "detecting…";
+  const p = S.ptp;
+  $("ptp").innerHTML = p.state === "disabled" ? `<span class="bad">unavailable</span>` :
+    `<span class="${p.locked ? "ok" : "warn"}">${esc(p.state)}</span> <span class="mut">${esc(p.gm || "")}</span>`;
+  $("nmos").innerHTML = S.nmos ? `<a href="${esc(S.nmos)}" target="_blank">node API</a>` : "off";
+  let a = "";
+  if(!S.ptp_ports_ok || p.state === "disabled") a += `<p class="bad">Clock sync can't start: needs permission for PTP ports. Click <b>Run setup</b> in Settings (as admin) once.</p>`;
+  if(!S.streams.length) a += `<p class="mut">No streams seen yet. In Dante Controller enable AES67 mode on your device and create an AES67 multicast flow.</p>`;
+  $("alerts").innerHTML = a;
+  $("sends").innerHTML = cfg.sends.map((s, i) => {
+    const live = S.sends[i] || {};
+    return `<div class="row">
+      <input class="grow" value="${esc(s.name)}" oninput="cfg.sends[${i}].name=this.value;dirty()" title="Stream name">
+      <select onchange="cfg.sends[${i}].device=this.value||null;dirty()">${devOpts("in", s.device)}</select>
+      <input type="number" min="1" max="8" value="${s.channels}" title="Channels" oninput="cfg.sends[${i}].channels=+this.value;dirty()">
+      <select onchange="cfg.sends[${i}].rate=+this.value;dirty()">${[44100,48000,96000].map(r=>`<option ${r===s.rate?"selected":""}>${r}</option>`).join("")}</select>
+      <span class="pill">${live.packets ? `<span class="ok">● live</span> ${esc(live.address)}` : "idle"}</span>
+      <button class="x" onclick="cfg.sends.splice(${i},1);dirty()">✕</button></div>`; }).join("") || `<p class="mut">Nothing sent.</p>`;
+  $("recvs").innerHTML = cfg.receives.map((r, i) => {
+    const live = S.receives[i] || {};
+    const names = [...new Set(S.streams.map(s => s.name).concat(r.stream ? [r.stream] : []))];
+    return `<div class="row">
+      <select class="grow" onchange="cfg.receives[${i}].stream=this.value;dirty()"><option value="">— choose stream —</option>
+        ${names.map(n => `<option ${n===r.stream?"selected":""}>${esc(n)}</option>`).join("")}</select>
+      <select onchange="cfg.receives[${i}].device=this.value||null;dirty()">${devOpts("out", r.device)}</select>
+      <input type="number" min="1" max="500" value="${r.latency_ms}" title="Latency (ms)" oninput="cfg.receives[${i}].latency_ms=+this.value;dirty()"> ms
+      <span class="pill">${live.connected ? `<span class="ok">● ${esc(live.connected)}</span> lost ${live.lost} · ${live.drift_ppm>0?"+":""}${live.drift_ppm} ppm` : (r.stream ? `<span class="warn">waiting</span>` : "idle")}</span>
+      <button class="x" onclick="cfg.receives.splice(${i},1);dirty()">✕</button></div>`; }).join("") || `<p class="mut">Nothing received.</p>`;
+  $("streams").innerHTML = S.streams.map(s => `<tr><td><b>${esc(s.name)}</b></td><td class="mut">${esc(s.address)}:${s.port}</td>
+      <td>${esc(s.encoding)}/${s.rate}/${s.channels}ch</td><td class="mut">${esc(s.origin_ip)}</td></tr>`).join("")
+      || `<tr><td class="mut">Listening…</td></tr>`;
+  if(!isDirty){ $("ifaceIn").value = cfg.interface === "auto" ? "" : cfg.interface; $("canLead").checked = cfg.ptp_can_lead;
+    $("rav").checked = cfg.ravenna; $("nmosIn").checked = cfg.nmos; }
+  $("auto").checked = S.autostart;
+  $("log").textContent = S.log.join("\n");
+}
+function addSend(){ cfg.sends.push({name:"Send " + (cfg.sends.length + 1), channels:2, device:null, tone:null, rate:48000, encoding:"L24", ptime:1, address:null, port:5004}); dirty(); render(); }
+function addRecv(){ cfg.receives.push({stream:"", device:null, latency_ms:10, null:false}); dirty(); render(); }
+async function save(){
+  cfg.interface = $("ifaceIn").value.trim() || "auto"; cfg.ptp_can_lead = $("canLead").checked;
+  cfg.ravenna = $("rav").checked; cfg.nmos = $("nmosIn").checked;
+  await post({config: cfg}); isDirty = false; bar();
+}
+// re-render edits immediately for add/remove, but keep typing smooth
+document.addEventListener("click", e => { if (e.target.classList.contains("x")) render(); });
+async function tick(){
+  try { S = await (await fetch("/api/state")).json(); if (!isDirty) render(); } catch(e) {}
+  setTimeout(tick, 1000);
+}
+(async () => { try { const d = await (await fetch("/api/devices")).json(); devs = Array.isArray(d) ? d : []; } catch(e) {} tick(); })();
+</script>
+</body>
+</html>
