@@ -61,8 +61,8 @@ class Config:
     def load(cls, path: Path | None = None) -> "Config":
         path = path or config_path()
         if not path.exists():
-            return cls(sends=[SendCfg(socket.gethostname()[:28] or "aes67-vsc")],
-                       receives=[RecvCfg("")])  # empty slot: patch it from NMOS or the UI
+            return cls(sends=[SendCfg(socket.gethostname()[:28] or "aes67-vsc", device="virtual")],
+                       receives=[RecvCfg("", device="virtual")])  # empty slot: patch it from NMOS or the UI
         d = json.loads(path.read_text())
         known = {f for f in cls.__dataclass_fields__ if f not in ("sends", "receives")}
         return cls(**{k: v for k, v in d.items() if k in known},
@@ -131,7 +131,15 @@ class Engine:
                         s.rate, s.channels, s.ptime, 96, self.ip, random.getrandbits(31),
                         self.clock.gm_id or "00-00-00-00-00-00-00-00", self.cfg.ptp_domain)
         try:
-            src = ToneSource(s.channels, s.rate, s.tone) if s.tone else DeviceSource(s.channels, s.rate, s.device)
+            if s.tone:
+                src = ToneSource(s.channels, s.rate, s.tone)
+            elif s.device == "virtual":
+                from . import virtual
+                src = virtual.resolve("send", s.name, s.channels, s.rate, self.log)
+                if src is None:
+                    return
+            else:
+                src = DeviceSource(s.channels, s.rate, s.device)
         except Exception as e:  # noqa: BLE001 - sound card errors vary by platform
             self.log(f"! send {s.name!r}: can't open input device: {e}")
             return
@@ -178,7 +186,12 @@ class Engine:
         if not r.null:
             from .audio import DeviceSink
             try:
-                sink = DeviceSink(rx.buf, st.rate, r.device)
+                if r.device == "virtual":
+                    from . import virtual
+                    make = virtual.resolve("recv", r.stream or st.name, st.channels, st.rate, self.log)
+                    sink = make(rx.buf) if make else None
+                else:
+                    sink = DeviceSink(rx.buf, st.rate, r.device)
             except Exception as e:  # noqa: BLE001
                 self.log(f"! receive {st.name!r}: can't open output device: {e}")
         with self._lock:
@@ -216,3 +229,8 @@ class Engine:
             self.ravenna.close()
         if self.clock:
             self.clock.stop()
+        try:
+            from . import virtual
+            virtual.cleanup()
+        except Exception:  # noqa: BLE001
+            pass

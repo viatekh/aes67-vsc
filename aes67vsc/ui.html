@@ -76,7 +76,7 @@ async function post(o){ const r = await fetch("/api/apply",{method:"POST",header
 async function setup(){ const r = await post({setup:true}); alert(r.ok ? "Done." : "Some steps failed — run the app as administrator once, then try again. See the log."); }
 function devOpts(kind, sel){
   const list = devs.filter(d => kind === "in" ? d.in > 0 : d.out > 0);
-  return `<option value="">System default</option>` + list.map(d => `<option value="${esc(d.name)}" ${d.name === sel ? "selected" : ""}>${esc(d.name)}</option>`).join("");
+  return `<option value="virtual" ${sel==="virtual"?"selected":""}>Virtual sound card (other apps)</option><option value="" ${!sel?"selected":""}>System default</option>` + list.map(d => `<option value="${esc(d.name)}" ${d.name === sel ? "selected" : ""}>${esc(d.name)}</option>`).join("");
 }
 function render(){
   if(!S) return;
