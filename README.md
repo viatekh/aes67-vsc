@@ -1,4 +1,4 @@
-# aes67-vsc — AES67 virtual soundcard
+# aes67-vsc — AES67 + Dante virtual soundcard
 
 A plug-and-play network sound card for Windows, macOS and Linux. It works with:
 - **Dante** devices (in AES67 mode)
@@ -31,6 +31,25 @@ aes67-vsc            # opens the tray icon + control panel at http://127.0.0.1:8
 | **Clock drift** | Corrects drift with smooth resampling (±5000 ppm range), so there are no clicks or dropouts. |
 | **Sound card** | Device "Virtual sound card" shows up in your other apps, see below. |
 
+## Native Dante mode (experimental)
+Turn on **Dante → "Appear in Dante Controller"** in the control panel. This computer then shows up in
+Dante Controller as a regular Dante device, with TX and RX channels you route in the normal grid.
+- No AES67 mode is needed on your Dante gear.
+- Other apps reach those channels through the virtual sound card.
+
+How it works:
+- The app speaks Dante's own discovery, control and audio protocols.
+- It follows the Dante network clock (PTPv1).
+- The code is a Python port of [Inferno](https://github.com/teodly/inferno), an open-source,
+  reverse-engineered Dante implementation. That's why this project is GPL.
+
+**Important:**
+- This is **unofficial**. Dante is Audinate's trademark and undocumented protocol. This project is not
+  made, endorsed or supported by Audinate. It may break with Dante firmware updates and is not for critical shows.
+- A real Dante device (or Dante Virtual Soundcard/Via) must be on the network to provide the clock.
+- Unicast audio only so far. Dante multicast flows, Dante Domain Manager, and renaming TX channels from Dante Controller aren't supported.
+- Quit Dante Virtual Soundcard and Dante Via on the same computer first, because they use the same ports. Dante Controller is fine.
+
 ## Virtual sound card (use it from Zoom, a DAW, OBS…)
 - **Linux** (PulseAudio/PipeWire): creates real devices. Each send adds a speaker "AES67 &lt;name&gt;", each receive adds a mic "AES67 &lt;stream&gt;". They're removed on exit.
 - **macOS:** install [BlackHole](https://existential.audio/blackhole/) 2ch and 16ch (free). They're detected automatically.
@@ -56,9 +75,14 @@ Config is saved per user. `aes67-vsc config` shows where.
 ## Limits
 - 44.1/48/96 kHz, L16/L24, 1–8 channels per stream. Dante's AES67 mode is usually 48 kHz only.
 - Clock sync uses software timestamps, accurate to ~10–100 µs on a LAN. That is fine for Dante's ≥1 ms latency, but not sample-accurate like hardware PTP.
-- It doesn't appear as a *native* Dante device in Dante Controller. It appears through Dante's AES67 support instead.
 - No signed native driver on macOS/Windows yet; those use the free virtual cables above.
 
+## License
+GPL-3.0-or-later (see `LICENSE`). The native Dante support is ported from
+[Inferno](https://github.com/teodly/inferno) (GPL-3.0-or-later). The PTPv1 message formats follow
+Inferno's [Statime fork](https://github.com/teodly/statime/tree/inferno-dev).
+
 ## Development
-`pytest tests`: codec, SDP/SAP, PTP election and sync, drift, multi-stream, RAVENNA, NMOS, and the Linux virtual devices.
+`pytest tests`: codec, SDP/SAP, PTP election and sync (v2 and v1), drift, multi-stream, RAVENNA, NMOS,
+the Linux virtual devices, and native Dante (two virtual Dante devices routing audio to each other).
 `.github/workflows/build.yml` runs the tests and builds installers for all three platforms. A tag `v*` publishes a release.

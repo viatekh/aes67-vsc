@@ -88,6 +88,10 @@ class Clock:
         self._pending_sync: dict[int, int] = {}
         self._pending_dreq: dict[int, int] = {}
         self._seq = {SYNC: 0, DELAY_REQ: 0, ANNOUNCE: 0}
+        # PTPv1 (IEEE 1588-2002): what Dante uses natively. Follower only.
+        self.version = 2                  # protocol of the clock we follow
+        self._v1_masters: dict[bytes, tuple[float, int, bytes]] = {}  # src -> (seen, stratum, gm uuid)
+        self._v1_uuid = self.port_id[:3] + self.port_id[5:8]           # MAC from our EUI-64
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._start_time = time.monotonic()
@@ -164,13 +168,16 @@ class Clock:
             for p in [p for p, (t, _, to) in self._foreign.items() if now - t > to]:
                 del self._foreign[p]
             best = min(self._foreign.items(), key=lambda kv: kv[1][1].key(), default=None)
+            for p in [p for p, (t, _, _) in self._v1_masters.items() if now - t > 3]:
+                del self._v1_masters[p]
+            v1 = min(self._v1_masters.items(), key=lambda kv: (kv[1][1], kv[0]), default=None)
         if best and (not self.can_lead or best[1][1].key() < self.own.key()):
             if self._master_port != best[0]:
-                self._master_port = best[0]
-                self._ms.clear()
-                self._sm.clear()
-                self.path_delay_ns = None
-                self._set_state("follower", fmt_id(best[1][1].identity))
+                self._follow(best[0], 2, fmt_id(best[1][1].identity))
+        elif v1:  # a Dante (PTPv1) leader is on the network: never compete with it
+            if self._master_port != v1[0]:
+                gm = v1[1][2]
+                self._follow(v1[0], 1, fmt_id(gm[:3] + b"\xff\xfe" + gm[3:]))
         elif self.can_lead and now - self._start_time > ANNOUNCE_TIMEOUT * 2.0 ** LOG_ANNOUNCE:
             if self.state != "leader":
                 self._master_port = None
@@ -181,6 +188,14 @@ class Clock:
             self._master_port = None
             self._set_state("listening", self.gm_id)
 
+    def _follow(self, port: bytes, version: int, gm: str):
+        self._master_port, self.version = port, version
+        self._ms.clear()
+        self._sm.clear()
+        self._pending_sync.clear()
+        self.path_delay_ns = None
+        self._set_state("follower", gm)
+
     def _set_state(self, state, gm):
         changed = gm != self.gm_id
         self.state, self.gm_id = state, gm
@@ -190,6 +205,8 @@ class Clock:
 
     # ---- receive ----------------------------------------------------------
     def _handle(self, p: bytes, rx: int, addr=None):
+        if len(p) >= 40 and p[0] == 0 and p[1] == 1:
+            return self._handle_v1(p, rx)
         if len(p) < 34 or p[1] & 0x0F != 2 or p[4] != self.domain:
             return
         mtype = p[0] & 0x0F
@@ -227,6 +244,36 @@ class Clock:
             t3 = self._pending_dreq.pop(seq, None)
             if t3 is not None:
                 self._sm.append(_ts_get(p, 34) - corr - t3)
+                self._update()
+
+    def _handle_v1(self, p: bytes, rx: int):
+        """PTPv1: 40-byte header, control field at byte 32 (0 Sync, 1 Delay_Req, 2 Follow_Up, 3 Delay_Resp)."""
+        ctrl, src, seq = p[32], p[22:30], struct.unpack_from("!H", p, 30)[0]
+        if src[:6] == self._v1_uuid:
+            return
+        b = 40  # body
+        if ctrl == 0 and len(p) >= b + 84:  # Sync: only masters send it
+            with self._lock:
+                self._v1_masters[src] = (time.monotonic(), p[b + 27], p[b + 14:b + 20])
+            if src != self._master_port:
+                return
+            if p[35] & 0x08:  # PTP_ASSIST: two-step, time follows in Follow_Up
+                self._pending_sync[seq] = rx
+                if len(self._pending_sync) > 32:
+                    self._pending_sync.pop(next(iter(self._pending_sync)))
+            else:
+                self._sync_sample(_ts_v1(p, b), rx)
+        elif src != self._master_port:
+            return
+        elif ctrl == 2 and len(p) >= b + 12:  # Follow_Up
+            t2 = self._pending_sync.pop(struct.unpack_from("!H", p, b + 2)[0], None)
+            if t2 is not None:
+                self._sync_sample(_ts_v1(p, b + 4), t2)
+        elif ctrl == 3 and len(p) >= b + 20 and p[b + 10:b + 16] == self._v1_uuid \
+                and struct.unpack_from("!H", p, b + 16)[0] == 1:  # Delay_Resp for us
+            t3 = self._pending_dreq.pop(struct.unpack_from("!H", p, b + 18)[0], None)
+            if t3 is not None:
+                self._sm.append(_ts_v1(p, b) - t3)
                 self._update()
 
     def _sync_sample(self, t1: int, t2: int):
@@ -300,10 +347,31 @@ class Clock:
     def _send_delay_req(self):
         seq = self._next(DELAY_REQ)
         t3 = time.time_ns()
-        self._send(self._header(DELAY_REQ, 44, seq, 0x7F), EVENT_PORT)
+        if self.version == 1:
+            self._send(self._v1_delay_req(seq, t3), EVENT_PORT)
+        else:
+            self._send(self._header(DELAY_REQ, 44, seq, 0x7F), EVENT_PORT)
         self._pending_dreq[seq] = t3
         if len(self._pending_dreq) > 16:
             self._pending_dreq.pop(next(iter(self._pending_dreq)))
+
+
+    def _v1_delay_req(self, seq: int, t3: int) -> bytes:
+        h = bytearray(124)
+        struct.pack_into("!HH", h, 0, 1, 1)               # versionPTP 1, versionNetwork 1
+        h[4:9] = b"_DFLT"                                  # subdomain
+        h[20], h[21] = 1, 1                                # event message, ethernet
+        h[22:28] = self._v1_uuid
+        struct.pack_into("!HHB", h, 28, 1, seq, 1)         # port 1, sequence, control = Delay_Req
+        local = t3 + (self.offset_ns or 0)
+        struct.pack_into("!II", h, 40, (local // 1_000_000_000) & 0xFFFFFFFF, local % 1_000_000_000)
+        h[40 + 55] = 255                                   # local stratum: worst
+        return bytes(h)
+
+
+def _ts_v1(b: bytes, off: int) -> int:
+    sec, ns = struct.unpack_from("!II", b, off)
+    return sec * 1_000_000_000 + ns
 
 
 Follower = Clock  # backwards compatibility

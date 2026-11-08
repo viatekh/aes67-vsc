@@ -48,6 +48,18 @@ class RecvCfg:
 
 
 @dataclass
+class DanteCfg:
+    """Appear as a native Dante device in Dante Controller (unofficial, reverse-engineered)."""
+    enabled: bool = False
+    name: str = ""                     # default: computer name
+    tx_channels: int = 2               # channels this computer sends to Dante
+    rx_channels: int = 2               # channels this computer receives from Dante
+    tx_device: str | int | None = "virtual"
+    rx_device: str | int | None = "virtual"
+    latency_ms: float = 10
+
+
+@dataclass
 class Config:
     interface: str = "auto"
     ptp_domain: int = 0
@@ -56,6 +68,7 @@ class Config:
     nmos: bool = True                  # NMOS IS-04/IS-05 node
     sends: list[SendCfg] = field(default_factory=list)
     receives: list[RecvCfg] = field(default_factory=list)
+    dante: DanteCfg = field(default_factory=DanteCfg)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Config":
@@ -64,10 +77,15 @@ class Config:
             return cls(sends=[SendCfg(socket.gethostname()[:28] or "aes67-vsc", device="virtual")],
                        receives=[RecvCfg("", device="virtual")])  # empty slot: patch it from NMOS or the UI
         d = json.loads(path.read_text())
-        known = {f for f in cls.__dataclass_fields__ if f not in ("sends", "receives")}
+        return cls.from_dict(d)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Config":
+        known = {f for f in cls.__dataclass_fields__ if f not in ("sends", "receives", "dante")}
         return cls(**{k: v for k, v in d.items() if k in known},
                    sends=[SendCfg(**s) for s in d.get("sends", [])],
-                   receives=[RecvCfg(**r) for r in d.get("receives", [])])
+                   receives=[RecvCfg(**r) for r in d.get("receives", [])],
+                   dante=DanteCfg(**d.get("dante", {})))
 
     def save(self, path: Path | None = None):
         path = path or config_path()
@@ -115,6 +133,9 @@ class Engine:
                 self.log(f"! RAVENNA/mDNS discovery unavailable: {e}")
         for i, s in enumerate(c.sends):
             self._start_send(i, s)
+        self.dante = None
+        if c.dante.enabled:
+            self._start_dante()
         if c.nmos:
             try:
                 from .nmos import Node
@@ -149,6 +170,46 @@ class Engine:
         if self.ravenna:
             self.ravenna.advertise(st)
         self.log(f"Sending {s.name!r} -> {st.address}:{st.port} {s.encoding}/{s.rate}/{s.channels}ch")
+
+    def _start_dante(self):
+        from .audio import DeviceSink, DeviceSource
+        from .dante.device import DanteDevice, DeviceInfo, dante_name
+        from .elastic import ElasticBuffer
+        d, rate = self.cfg.dante, 48000
+        name = dante_name(d.name or socket.gethostname().split(".")[0])
+        try:
+            src = None
+            if d.tx_channels > 0:
+                if d.tx_device == "virtual":
+                    from . import virtual
+                    src = virtual.resolve("send", name + " Dante", d.tx_channels, rate, self.log)
+                else:
+                    src = DeviceSource(d.tx_channels, rate, d.tx_device)
+            out = ElasticBuffer(max(1, d.rx_channels), rate, int(rate * 0.02)) if d.rx_channels > 0 else None
+            self._dante_sink = None
+            if out is not None:
+                if d.rx_device == "virtual":
+                    from . import virtual
+                    make = virtual.resolve("recv", name + " Dante", d.rx_channels, rate, self.log)
+                    self._dante_sink = make(out) if make else None
+                else:
+                    self._dante_sink = DeviceSink(out, rate, d.rx_device)
+            info = DeviceInfo(name, self.ip, [f"RX {k + 1}" for k in range(d.rx_channels)],
+                              [f"TX {k + 1}" for k in range(d.tx_channels)], rate=rate,
+                              latency_ns=int(d.latency_ms * 1_000_000))
+            self.dante = DanteDevice(info, self.clock, src, out, zc=self.ravenna.zc if self.ravenna else None,
+                                     log=self.log)
+            self.dante.start()
+            if self.clock.state == "leader":
+                self.log("! Dante: no Dante clock leader found. Native Dante audio needs a Dante device "
+                         "(or Dante Virtual Soundcard/Via) on the network to provide the clock.")
+        except OSError as e:
+            self.log(f"! Dante: can't start ({e}). Is Dante Virtual Soundcard or Dante Via running on this "
+                     "computer? They use the same ports; quit them first.")
+            self.dante = None
+        except Exception as e:  # noqa: BLE001
+            self.log(f"! Dante: can't start: {e}")
+            self.dante = None
 
     def _watch(self):
         """Connect receivers when their stream appears; reconnect if it moves."""
@@ -206,7 +267,11 @@ class Engine:
             sink.close()
 
     def status(self) -> str:
-        parts = [f"ptp={self.clock.state}" + ("" if self.clock.locked else "(unsynced)")]
+        parts = [f"ptp={self.clock.state}" + (f"/v{self.clock.version}" if self.clock.state == "follower" else "")
+                 + ("" if self.clock.locked else "(unsynced)")]
+        if getattr(self, "dante", None):
+            subs = sum(1 for s in self.dante.subs if s)
+            parts.append(f"dante[tx flows={len(self.dante.tx.flows) if self.dante.tx else 0} rx subs={subs}]")
         parts += [f"tx[{t.stream.name}]={t.packets}" for t in self.senders]
         with self._lock:
             for rx, _, st in self.receivers.values():
@@ -219,6 +284,10 @@ class Engine:
         self._kick.set()
         if self.nmos:
             self.nmos.close()
+        if getattr(self, "dante", None):
+            self.dante.stop()
+            if getattr(self, "_dante_sink", None):
+                self._dante_sink.close()
         for t in self.senders:
             t.stop()
         for i in list(self.receivers):

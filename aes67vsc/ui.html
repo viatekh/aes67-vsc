@@ -31,7 +31,7 @@ table{width:100%;border-collapse:collapse}td{padding:6px 4px;border-top:1px soli
 <body>
 <main>
   <h1>AES67 Virtual Soundcard</h1>
-  <div class="sub">Works with Dante (AES67 mode), RAVENNA, NMOS and other AES67 devices.</div>
+  <div class="sub">Works with Dante (native or AES67 mode), RAVENNA, NMOS and other AES67 devices.</div>
 
   <section class="card"><h2>Status</h2>
     <div class="grid">
@@ -49,6 +49,21 @@ table{width:100%;border-collapse:collapse}td{padding:6px 4px;border-top:1px soli
     <div id="recvs"></div></section>
 
   <section class="card"><h2>Streams on the network</h2><table id="streams"></table></section>
+
+  <section class="card"><h2>Dante <span class="pill" id="danteState">off</span></h2>
+    <div class="row"><label class="grow">Appear in Dante Controller as a native Dante device<br>
+      <span class="mut">Unofficial, reverse-engineered. Needs a Dante device on the network for the clock.</span></label>
+      <input type="checkbox" id="danteOn" onchange="cfg.dante.enabled=this.checked;dirty()"></div>
+    <div class="row"><label class="grow">Device name</label>
+      <input id="danteName" placeholder="computer name" oninput="cfg.dante.name=this.value;dirty()"></div>
+    <div class="row"><label class="grow">Channels to Dante (TX) / from Dante (RX)</label>
+      <input type="number" id="danteTx" min="0" max="64" oninput="cfg.dante.tx_channels=+this.value;dirty()">
+      <input type="number" id="danteRx" min="0" max="64" oninput="cfg.dante.rx_channels=+this.value;dirty()"></div>
+    <div class="row"><label class="grow">Audio from (TX) / to (RX)</label>
+      <select id="danteTxDev" onchange="cfg.dante.tx_device=this.value||null;dirty()"></select>
+      <select id="danteRxDev" onchange="cfg.dante.rx_device=this.value||null;dirty()"></select></div>
+    <div id="danteInfo" class="mut"></div>
+  </section>
 
   <section class="card"><h2>Settings</h2>
     <div class="row"><label class="grow">Network interface</label>
@@ -85,6 +100,14 @@ function render(){
   const p = S.ptp;
   $("ptp").innerHTML = p.state === "disabled" ? `<span class="bad">unavailable</span>` :
     `<span class="${p.locked ? "ok" : "warn"}">${esc(p.state)}</span> <span class="mut">${esc(p.gm || "")}</span>`;
+  const D = S.dante;
+  $("danteState").innerHTML = D ? `<span class="ok">● ${esc(D.name)}</span>` : (cfg.dante.enabled ? `<span class="warn">starting…</span>` : "off");
+  $("danteInfo").innerHTML = D ? (D.tx_flows.map(f => `Sending ${f.channels} ch to ${esc(f.to)}`).concat(
+      D.rx.filter(r => r.from).map(r => `${esc(r.channel)} ← ${esc(r.from)} ${r.ok ? '<span class="ok">✓</span>' : '<span class="warn">connecting</span>'}`)).join("<br>")
+      || "Route channels to and from this computer in Dante Controller.") : "";
+  if(!isDirty){ $("danteOn").checked = cfg.dante.enabled; $("danteName").value = cfg.dante.name;
+    $("danteTx").value = cfg.dante.tx_channels; $("danteRx").value = cfg.dante.rx_channels;
+    $("danteTxDev").innerHTML = devOpts("in", cfg.dante.tx_device); $("danteRxDev").innerHTML = devOpts("out", cfg.dante.rx_device); }
   $("nmos").innerHTML = S.nmos ? `<a href="${esc(S.nmos)}" target="_blank">node API</a>` : "off";
   let a = "";
   if(!S.ptp_ports_ok || p.state === "disabled") a += `<p class="bad">Clock sync can't start: needs permission for PTP ports. Click <b>Run setup</b> in Settings (as admin) once.</p>`;

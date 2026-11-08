@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 
 from . import system
-from .engine import Config, Engine, RecvCfg, SendCfg
+from .engine import Config, Engine
 
 UI_PORT = 8067
 
@@ -67,9 +67,20 @@ class App:
             "sends": tx or [asdict(s) for s in self.cfg.sends], "receives": rx,
             "streams": [asdict(s) for s in (e.discovered() if e and e.browser else [])],
             "nmos": f"http://{e.ip}:{e.nmos.port}/x-nmos/" if e and e.nmos else None,
+            "dante": self._dante_state(e),
             "autostart": system.autostart_enabled(), "ptp_ports_ok": system.ptp_ports_allowed(),
             "config": asdict(self.cfg), "log": self.logs[-30:],
         }
+
+    def _dante_state(self, e):
+        d = getattr(e, "dante", None) if e else None
+        if not d:
+            return None
+        return {"name": d.info.name,
+                "tx_flows": [{"to": f.rx_host, "channels": sum(c is not None for c in f.channels)}
+                             for f in (d.tx.flows.values() if d.tx else [])],
+                "rx": [{"channel": d.info.rx_names[k], "from": f"{s.tx_channel}@{s.tx_host}" if s else None,
+                        "ok": bool(s and s.status == 0x01010009)} for k, s in enumerate(d.subs)]}
 
     def devices(self):
         try:
@@ -82,9 +93,7 @@ class App:
     def apply(self, body):
         if "config" in body:
             c = body["config"]
-            self.cfg = Config(**{k: v for k, v in c.items() if k not in ("sends", "receives")},
-                              sends=[SendCfg(**s) for s in c.get("sends", [])],
-                              receives=[RecvCfg(**r) for r in c.get("receives", [])])
+            self.cfg = Config.from_dict(c)
             self.cfg.save(self.cfg_path)
             self.restart()
         if "autostart" in body:
