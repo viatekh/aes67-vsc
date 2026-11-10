@@ -77,10 +77,12 @@ class App:
         if not d:
             return None
         return {"name": d.info.name,
-                "tx_flows": [{"to": f.rx_host, "channels": sum(c is not None for c in f.channels)}
+                "clock": (("leading the Dante clock" if e.clock.state == "leader" else
+                           f"following PTPv{e.clock.version} clock") if e.clock and e.clock.locked else "no clock yet"),
+                "tx_flows": [{"to": f.rx_host or "multicast", "channels": sum(c is not None for c in f.channels)}
                              for f in (d.tx.flows.values() if d.tx else [])],
                 "rx": [{"channel": d.info.rx_names[k], "from": f"{s.tx_channel}@{s.tx_host}" if s else None,
-                        "ok": bool(s and s.status == 0x01010009)} for k, s in enumerate(d.subs)]}
+                        "ok": bool(s and s.status in (0x01010009, 0x0101000A))} for k, s in enumerate(d.subs)]}
 
     def devices(self):
         try:

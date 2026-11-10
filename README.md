@@ -37,17 +37,25 @@ Dante Controller as a regular Dante device, with TX and RX channels you route in
 - No AES67 mode is needed on your Dante gear.
 - Other apps reach those channels through the virtual sound card.
 
+What works:
+- Routing in both directions, unicast and multicast flows, 16/24/32-bit, 44.1–192 kHz.
+- Renaming the device and its channels, changing latency and sample rate, level meters, all from Dante Controller.
+- Names and routing survive a restart, like on real devices.
+- Clock: follows the Dante network clock (PTPv1). If there is no Dante device, the app provides the clock itself,
+  so two computers running this app can also work alone.
+
 How it works:
 - The app speaks Dante's own discovery, control and audio protocols.
-- It follows the Dante network clock (PTPv1).
 - The code is a Python port of [Inferno](https://github.com/teodly/inferno), an open-source,
   reverse-engineered Dante implementation. That's why this project is GPL.
 
 **Important:**
 - This is **unofficial**. Dante is Audinate's trademark and undocumented protocol. This project is not
   made, endorsed or supported by Audinate. It may break with Dante firmware updates and is not for critical shows.
-- A real Dante device (or Dante Virtual Soundcard/Via) must be on the network to provide the clock.
-- Unicast audio only so far. Dante multicast flows, Dante Domain Manager, and renaming TX channels from Dante Controller aren't supported.
+- It has only been tested against itself and against the open-source Dante tools' protocol descriptions,
+  **not yet against real Dante hardware**. Please report what you see.
+- Our software clock is less precise than hardware. Where a Dante device exists, it takes over as clock leader automatically.
+- Not supported: Dante Domain Manager, AES67-mode flows created *by* this Dante device (use the AES67 senders above), device lock, redundancy (secondary network).
 - Quit Dante Virtual Soundcard and Dante Via on the same computer first, because they use the same ports. Dante Controller is fine.
 
 ## Virtual sound card (use it from Zoom, a DAW, OBS…)

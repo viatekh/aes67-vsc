@@ -52,7 +52,7 @@ table{width:100%;border-collapse:collapse}td{padding:6px 4px;border-top:1px soli
 
   <section class="card"><h2>Dante <span class="pill" id="danteState">off</span></h2>
     <div class="row"><label class="grow">Appear in Dante Controller as a native Dante device<br>
-      <span class="mut">Unofficial, reverse-engineered. Needs a Dante device on the network for the clock.</span></label>
+      <span class="mut">Unofficial, reverse-engineered. Follows the Dante clock, or provides it if there is none.</span></label>
       <input type="checkbox" id="danteOn" onchange="cfg.dante.enabled=this.checked;dirty()"></div>
     <div class="row"><label class="grow">Device name</label>
       <input id="danteName" placeholder="computer name" oninput="cfg.dante.name=this.value;dirty()"></div>
@@ -104,7 +104,7 @@ function render(){
   $("danteState").innerHTML = D ? `<span class="ok">● ${esc(D.name)}</span>` : (cfg.dante.enabled ? `<span class="warn">starting…</span>` : "off");
   $("danteInfo").innerHTML = D ? (D.tx_flows.map(f => `Sending ${f.channels} ch to ${esc(f.to)}`).concat(
       D.rx.filter(r => r.from).map(r => `${esc(r.channel)} ← ${esc(r.from)} ${r.ok ? '<span class="ok">✓</span>' : '<span class="warn">connecting</span>'}`)).join("<br>")
-      || "Route channels to and from this computer in Dante Controller.") : "";
+      || "Route channels to and from this computer in Dante Controller.") + ` <br>Clock: ${esc(D.clock)}` : "";
   if(!isDirty){ $("danteOn").checked = cfg.dante.enabled; $("danteName").value = cfg.dante.name;
     $("danteTx").value = cfg.dante.tx_channels; $("danteRx").value = cfg.dante.rx_channels;
     $("danteTxDev").innerHTML = devOpts("in", cfg.dante.tx_device); $("danteRxDev").innerHTML = devOpts("out", cfg.dante.rx_device); }
