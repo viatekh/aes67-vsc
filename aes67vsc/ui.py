@@ -40,7 +40,7 @@ class App:
         with self._lock:
             if self.engine:
                 self.engine.stop()
-            self.engine = Engine(self.cfg, log=self.log)
+            self.engine = Engine(self.cfg, log=self.log, cfg_path=self.cfg_path)
             threading.Thread(target=self.engine.start, daemon=True).start()
 
     def stop(self):

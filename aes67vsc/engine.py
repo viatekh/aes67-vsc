@@ -57,6 +57,7 @@ class DanteCfg:
     tx_device: str | int | None = "virtual"
     rx_device: str | int | None = "virtual"
     latency_ms: float = 10
+    rate: int = 48000                  # 44100 / 48000 / 88200 / 96000 (must match your Dante network)
 
 
 @dataclass
@@ -100,8 +101,10 @@ def default_address(ip: str, index: int, name: str) -> str:
 
 
 class Engine:
-    def __init__(self, cfg: Config, log=print):
-        self.cfg, self.log = cfg, log
+    def __init__(self, cfg: Config, log=print, cfg_path: Path | None = None):
+        self.cfg, self.log, self.cfg_path = cfg, log, cfg_path
+        self.dante = None
+        self._dante_sink = None
         self.ip = None
         self.clock: Clock | None = None
         self.browser: sap.Browser | None = None
@@ -117,7 +120,7 @@ class Engine:
         c = self.cfg
         self.ip = iface.choose() if c.interface in ("", "auto") else c.interface
         self.log(f"Network interface: {self.ip}")
-        self.clock = Clock(self.ip, c.ptp_domain, c.ptp_can_lead)
+        self.clock = Clock(self.ip, c.ptp_domain, c.ptp_can_lead, lead_v1=c.dante.enabled)
         if not self.clock.start():
             self.log(f"! PTP unavailable ({self.clock.error}). Run as admin/sudo for clock sync.")
         else:
@@ -133,7 +136,6 @@ class Engine:
                 self.log(f"! RAVENNA/mDNS discovery unavailable: {e}")
         for i, s in enumerate(c.sends):
             self._start_send(i, s)
-        self.dante = None
         if c.dante.enabled:
             self._start_dante()
         if c.nmos:
@@ -175,7 +177,8 @@ class Engine:
         from .audio import DeviceSink, DeviceSource
         from .dante.device import DanteDevice, DeviceInfo, dante_name
         from .elastic import ElasticBuffer
-        d, rate = self.cfg.dante, 48000
+        d = self.cfg.dante
+        rate = d.rate if d.rate in (44100, 48000, 88200, 96000) else 48000
         name = dante_name(d.name or socket.gethostname().split(".")[0])
         try:
             src = None
@@ -186,7 +189,6 @@ class Engine:
                 else:
                     src = DeviceSource(d.tx_channels, rate, d.tx_device)
             out = ElasticBuffer(max(1, d.rx_channels), rate, int(rate * 0.02)) if d.rx_channels > 0 else None
-            self._dante_sink = None
             if out is not None:
                 if d.rx_device == "virtual":
                     from . import virtual
@@ -197,8 +199,9 @@ class Engine:
             info = DeviceInfo(name, self.ip, [f"RX {k + 1}" for k in range(d.rx_channels)],
                               [f"TX {k + 1}" for k in range(d.tx_channels)], rate=rate,
                               latency_ns=int(d.latency_ms * 1_000_000))
+            state = config_path().parent / f"dante-{name}.json"
             self.dante = DanteDevice(info, self.clock, src, out, zc=self.ravenna.zc if self.ravenna else None,
-                                     log=self.log)
+                                     log=self.log, state_path=state, on_reconfigure=self._dante_reconfigure)
             self.dante.start()
             if self.clock.state == "leader":
                 self.log("! Dante: no Dante clock leader found. Native Dante audio needs a Dante device "
@@ -210,6 +213,26 @@ class Engine:
         except Exception as e:  # noqa: BLE001
             self.log(f"! Dante: can't start: {e}")
             self.dante = None
+
+    def _stop_dante(self):
+        if self.dante:
+            self.dante.stop()
+            self.dante = None
+        if getattr(self, "_dante_sink", None):
+            self._dante_sink.close()
+            self._dante_sink = None
+
+    def _dante_reconfigure(self, rate: int):
+        """A Dante controller changed our sample rate: restart the Dante device at the new rate."""
+        with self._lock:
+            self.cfg.dante.rate = rate
+            try:
+                self.cfg.save(self.cfg_path)
+            except OSError:
+                pass
+            self._stop_dante()
+            if not self._stop.is_set():
+                self._start_dante()
 
     def _watch(self):
         """Connect receivers when their stream appears; reconnect if it moves."""
@@ -284,10 +307,7 @@ class Engine:
         self._kick.set()
         if self.nmos:
             self.nmos.close()
-        if getattr(self, "dante", None):
-            self.dante.stop()
-            if getattr(self, "_dante_sink", None):
-                self._dante_sink.close()
+        self._stop_dante()
         for t in self.senders:
             t.stop()
         for i in list(self.receivers):

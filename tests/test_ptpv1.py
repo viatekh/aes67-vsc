@@ -62,3 +62,22 @@ def test_follows_dante_ptpv1_leader():
     finally:
         stop.set()
         c.stop()
+
+
+def test_leads_ptpv1_when_no_dante_clock():
+    """Without Dante hardware we provide the PTPv1 clock ourselves; a second node follows it."""
+    lead = Clock("127.0.0.1", identity=bytes.fromhex("0200aafffe000001"), lead_v1=True)
+    # Different PTPv2 domain, so the follower can only lock through our PTPv1 messages.
+    foll = Clock("127.0.0.1", domain=9, identity=bytes.fromhex("0200aafffe000002"), lead_v1=True)
+    lead.start()
+    foll.start()
+    try:
+        time.sleep(7)
+        assert lead.state == "leader"
+        assert foll.state == "follower" and foll.version == 1
+        assert foll.gm_id == "02-00-AA-FF-FE-00-00-01"
+        assert foll.path_delay_ns is not None, "PTPv1 delay request was not answered"
+        assert abs(foll.now_ns() - lead.now_ns()) < 2_000_000
+    finally:
+        lead.stop()
+        foll.stop()

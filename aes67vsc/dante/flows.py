@@ -1,4 +1,4 @@
-"""Dante audio flows (unicast). Ported from Inferno's flows_tx.rs / flows_rx.rs.
+"""Dante audio flows (unicast and multicast). Ported from Inferno's flows_tx.rs / flows_rx.rs.
 
 Packet: [0x02][u32 seconds][u32 sample-in-second][interleaved big-endian PCM]
 Timestamps are the network (PTP) clock in samples. Receivers keep a unicast
@@ -23,6 +23,14 @@ FPP_MIN, FPP_MAX, FPP_MAX_ADVERTISED = 2, 256, 32
 MAX_CHANNELS_IN_FLOW = 8
 MAX_FLOWS = 32
 MAX_PAYLOAD = 1400
+MULTICAST_MEDIA_PORT = 4321
+
+
+def peak_byte(peak: float) -> int:
+    """Linear peak (0..1) -> Dante meter byte: 0 = full scale, 0.5 dB per step, 254+ = silence."""
+    if peak <= 0:
+        return 0xFE
+    return int(min(0xFE, max(0, round(-40 * np.log10(peak)))))
 
 
 def encode(x: np.ndarray, bps: int) -> bytes:
@@ -99,9 +107,10 @@ def _samples_now(clock, rate: int) -> int | None:
 
 # --------------------------------------------------------------------------- TX
 class TxFlow:
-    def __init__(self, index: int, dst, channels: list, fpp: int, bps: int, rx_host="", rx_flow=""):
+    def __init__(self, index: int, dst, channels: list, fpp: int, bps: int, rx_host="", rx_flow="",
+                 multicast: bool = False):
         self.index, self.dst, self.channels, self.fpp, self.bps = index, dst, channels, fpp, bps
-        self.rx_host, self.rx_flow = rx_host, rx_flow
+        self.rx_host, self.rx_flow, self.multicast = rx_host, rx_flow, multicast
         self.cookie = int.from_bytes(os.urandom(2), "big")
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setblocking(False)
@@ -125,22 +134,37 @@ class Transmitter:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._fill_ts = None
+        self._peak = np.zeros(channels, np.float32)
         threading.Thread(target=self._run, daemon=True, name="dante-tx").start()
 
-    def add_flow(self, dst, channels, fpp, bps, rx_host="", rx_flow="") -> TxFlow:
+    def add_flow(self, dst, channels, fpp, bps, rx_host="", rx_flow="", index=None,
+                 multicast=False) -> TxFlow:
         with self._lock:
             for f in self.flows.values():  # same receiver socket: update instead
-                if f.dst == dst:
+                if f.dst == dst and not multicast:
                     f.channels = channels
                     return f
             if len(self.flows) >= MAX_FLOWS:
                 raise RuntimeError("too many flows")
-            idx = next(i for i in range(MAX_FLOWS) if i not in self.flows)
-            f = TxFlow(idx, dst, channels, fpp, bps, rx_host, rx_flow)
+            if index is None:
+                index = next(i for i in range(MAX_FLOWS) if i not in self.flows)
+            elif index in self.flows or not 0 <= index < MAX_FLOWS:
+                raise RuntimeError("flow id busy")
+            f = TxFlow(index, dst, channels, fpp, bps, rx_host, rx_flow, multicast)
+            if multicast:
+                f.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(self.ip))
+                f.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+                f.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
             f.sock.bind((self.ip, 0))
             f.sock.connect(dst)
-            self.flows[idx] = f
+            self.flows[index] = f
             return f
+
+    def peaks(self) -> bytes:
+        """Meter bytes per channel since the last call."""
+        with self._lock:
+            p, self._peak = self._peak, np.zeros(self.nch, np.float32)
+        return bytes(peak_byte(float(x)) for x in p)
 
     def by_handle(self, handle: bytes) -> TxFlow | None:
         idx, cookie = struct.unpack("!IH", handle[:6])
@@ -163,21 +187,26 @@ class Transmitter:
                 self._fill_ts = now
             n = now - self._fill_ts
             if n > 0:
-                self.ring.write(self._fill_ts, self.source.read(n))
+                data = self.source.read(n)
+                self.ring.write(self._fill_ts, data)
                 self._fill_ts = now
+                if len(data):
+                    with self._lock:
+                        self._peak = np.maximum(self._peak, np.abs(data).max(axis=0))
             # 2. send every flow's due packets
             t = time.monotonic()
             with self._lock:
                 flows = list(self.flows.values())
             for f in flows:
-                try:
-                    while f.sock.recv(64):  # keepalives from the receiver
-                        f.expires = t + KEEPALIVE_TIMEOUT
-                except (BlockingIOError, OSError):
-                    pass
-                if t > f.expires:
-                    self.remove_flow(f)
-                    continue
+                if not f.multicast:
+                    try:
+                        while f.sock.recv(64):  # keepalives from the receiver
+                            f.expires = t + KEEPALIVE_TIMEOUT
+                    except (BlockingIOError, OSError):
+                        pass
+                    if t > f.expires:
+                        self.remove_flow(f)
+                        continue
                 if f.next_ts is None or not -self.rate // 2 < now - f.next_ts < self.rate // 2:
                     f.next_ts = now - now % f.fpp  # align to packet boundary
                 while f.next_ts + f.fpp <= now:
@@ -203,11 +232,17 @@ class Transmitter:
 # --------------------------------------------------------------------------- RX
 class RxFlow:
     def __init__(self, index: int, iface_ip: str, channel_map: list, bps: int, latency: int,
-                 tx_host: str = "", tx_addr=None):
+                 tx_host: str = "", tx_addr=None, mcast=None):
         self.index, self.channel_map, self.bps, self.latency = index, channel_map, bps, latency
         self.tx_host, self.tx_addr = tx_host, tx_addr   # tx_addr: flow-control address (ip, port)
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((iface_ip, 0))
+        self.mcast = mcast                               # (group, port) for a multicast bundle
+        self.created = time.monotonic()
+        if mcast:
+            from ..net import multicast_rx
+            self.sock = multicast_rx(mcast[0], mcast[1], iface_ip)
+        else:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.bind((iface_ip, 0))
         self.sock.setblocking(False)
         self.port = self.sock.getsockname()[1]
         self.source = None          # where audio comes from (for keepalives)
@@ -229,13 +264,15 @@ class Receiver:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._play_ts = None
+        self._peak = np.zeros(channels, np.float32)
+        self.late = 0              # packets that arrived after their play time (dropped)
         threading.Thread(target=self._rx_loop, daemon=True, name="dante-rx").start()
         threading.Thread(target=self._play_loop, daemon=True, name="dante-play").start()
 
-    def new_flow(self, channel_map, bps, latency_samples, tx_host="", tx_addr=None) -> RxFlow:
+    def new_flow(self, channel_map, bps, latency_samples, tx_host="", tx_addr=None, mcast=None) -> RxFlow:
         with self._lock:
             idx = next(i for i in range(MAX_FLOWS) if i not in self.flows)
-            f = RxFlow(idx, self.ip, channel_map, bps, latency_samples, tx_host, tx_addr)
+            f = RxFlow(idx, self.ip, channel_map, bps, latency_samples, tx_host, tx_addr, mcast)
             self.flows[idx] = f
             self.latency = max([x.latency for x in self.flows.values()] + [self.rate // 100])
             return f
@@ -271,15 +308,24 @@ class Receiver:
                 ts, payload = p
                 f.source, f.packets, f.last_packet = src, f.packets + 1, time.monotonic()
                 frames = decode(payload, f.bps, len(f.channel_map))
-                if now is not None:
-                    f.actual_latency = max(f.actual_latency, (now - ts) % (1 << 32))
+                if now is not None and 0 <= now - ts < self.rate * 10:
+                    f.actual_latency = max(f.actual_latency, now - ts)
+                # Only write inside the window the player will still read. A packet behind the
+                # play head would otherwise sit in the ring and replay one ring-length later.
+                head = self._play_ts
+                if head is not None:
+                    if ts < head:
+                        self.late += 1
+                        continue
+                    if ts + len(frames) - head > self.ring.size - self.rate // 10:
+                        continue  # absurdly far in the future (clock mismatch)
                 for k, locals_ in enumerate(f.channel_map):
                     if locals_:
                         self.ring.write(ts, frames[:, k:k + 1].repeat(len(locals_), 1), locals_)
             if time.monotonic() >= next_ka:
                 next_ka = time.monotonic() + KEEPALIVE_INTERVAL
                 for f in flows:
-                    if f.source:
+                    if f.source and not f.mcast:
                         try:
                             f.sock.sendto(KEEPALIVE, f.source)
                         except OSError:
@@ -296,8 +342,14 @@ class Receiver:
                 self._play_ts = target
             n = target - self._play_ts
             if n > 0:
-                self.out.write(self.ring.read(self._play_ts, n, clear=True))
+                data = self.ring.read(self._play_ts, n, clear=True)
                 self._play_ts = target
+                self._peak = np.maximum(self._peak, np.abs(data).max(axis=0))
+                self.out.write(data)
+
+    def peaks(self) -> bytes:
+        p, self._peak = self._peak, np.zeros(self.nch, np.float32)
+        return bytes(peak_byte(float(x)) for x in p)
 
     def stop(self):
         self._stop.set()

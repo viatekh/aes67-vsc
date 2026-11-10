@@ -1,4 +1,4 @@
-"""PTPv2 (IEEE 1588-2008) node for the AES67 media profile.
+"""PTPv2 (IEEE 1588-2008) node for the AES67 media profile, plus PTPv1 (IEEE 1588-2002) for Dante.
 
 * Runs the Best Master Clock Algorithm: follows a better clock (e.g. a Dante
   device) when one exists, otherwise becomes grandmaster itself, so the app
@@ -31,6 +31,8 @@ TAI_UTC_OFFSET = 37
 
 SYNC, DELAY_REQ, FOLLOW_UP, DELAY_RESP, ANNOUNCE = 0x0, 0x1, 0x8, 0x9, 0xB
 CONTROL = {SYNC: 0, DELAY_REQ: 1, FOLLOW_UP: 2, DELAY_RESP: 3, ANNOUNCE: 5}
+
+V1_STRATUM, V1_VARIANCE, V1_LOG_SYNC = 4, 0x7FFF, -2   # our PTPv1 master properties (4 Sync/s)
 
 LOG_SYNC, LOG_ANNOUNCE = -3, 0  # 8 Sync/s, 1 Announce/s (AES67 media profile ranges)
 ANNOUNCE_TIMEOUT = 3  # announce intervals
@@ -70,8 +72,11 @@ class Clock:
     """PTP clock: `now_ns()` gives network (TAI) time whichever role we're in."""
 
     def __init__(self, iface_ip: str, domain: int = 0, can_lead: bool = True, priority1: int = 250,
-                 identity: bytes | None = None):
+                 identity: bytes | None = None, lead_v1: bool = False):
         self.iface_ip, self.domain, self.can_lead = iface_ip, domain, can_lead
+        # Also send PTPv1 Sync when we lead, so Dante devices (and other copies of this app in
+        # Dante mode) can follow us when no Dante hardware is around to provide the clock.
+        self.lead_v1 = lead_v1 and can_lead
         self.port_id = (identity or local_clock_id()) + b"\x00\x01"
         # Low priority by default so real hardware always wins the election.
         self.own = Dataset(priority1, 248, 0xFE, 0xFFFF, priority1, self.port_id[:8])
@@ -88,10 +93,13 @@ class Clock:
         self._pending_sync: dict[int, int] = {}
         self._pending_dreq: dict[int, int] = {}
         self._seq = {SYNC: 0, DELAY_REQ: 0, ANNOUNCE: 0}
-        # PTPv1 (IEEE 1588-2002): what Dante uses natively. Follower only.
+        # PTPv1 (IEEE 1588-2002): what Dante uses natively.
         self.version = 2                  # protocol of the clock we follow
-        self._v1_masters: dict[bytes, tuple[float, int, bytes]] = {}  # src -> (seen, stratum, gm uuid)
+        self._v1_masters: dict[bytes, tuple[float, tuple, bytes]] = {}  # src -> (seen, BMCA key, gm uuid)
         self._v1_uuid = self.port_id[:3] + self.port_id[5:8]           # MAC from our EUI-64
+        # Deliberately the worst acceptable master: any real Dante device wins the election.
+        self._v1_own_key = (1, V1_STRATUM, V1_VARIANCE, self._v1_uuid)
+        self._v1_seq = 0
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._start_time = time.monotonic()
@@ -136,7 +144,7 @@ class Clock:
     # ---- main loop --------------------------------------------------------
     def _run(self):
         socks = [self._ev, self._gen]
-        next_sync = next_announce = next_dreq = next_bmca = 0.0
+        next_sync = next_announce = next_dreq = next_bmca = next_v1 = 0.0
         while not self._stop.is_set():
             now = time.monotonic()
             if now >= next_bmca:
@@ -149,6 +157,9 @@ class Clock:
                 if now >= next_sync:
                     self._send_sync()
                     next_sync = now + 2.0 ** LOG_SYNC
+                if self.lead_v1 and now >= next_v1:
+                    self._send_v1_sync()
+                    next_v1 = now + 2.0 ** V1_LOG_SYNC
             elif self.state == "follower" and now >= next_dreq and self._ms:
                 self._send_delay_req()
                 next_dreq = now + random.uniform(0.5, 1.5)
@@ -170,7 +181,9 @@ class Clock:
             best = min(self._foreign.items(), key=lambda kv: kv[1][1].key(), default=None)
             for p in [p for p, (t, _, _) in self._v1_masters.items() if now - t > 3]:
                 del self._v1_masters[p]
-            v1 = min(self._v1_masters.items(), key=lambda kv: (kv[1][1], kv[0]), default=None)
+            v1 = min(self._v1_masters.items(), key=lambda kv: kv[1][1], default=None)
+        if v1 and self.lead_v1 and self._v1_own_key < v1[1][1]:
+            v1 = None   # we are the better PTPv1 master (only another copy of this app ranks this low)
         if best and (not self.can_lead or best[1][1].key() < self.own.key()):
             if self._master_port != best[0]:
                 self._follow(best[0], 2, fmt_id(best[1][1].identity))
@@ -252,9 +265,13 @@ class Clock:
         if src[:6] == self._v1_uuid:
             return
         b = 40  # body
+        if ctrl == 1 and self.state == "leader" and self.lead_v1:
+            return self._send_v1_delay_resp(p, rx)
         if ctrl == 0 and len(p) >= b + 84:  # Sync: only masters send it
+            # preferred flag, stratum, variance, uuid: lower wins (simplified IEEE 1588-2002 BMCA)
+            key = (0 if p[b + 37] else 1, p[b + 27], struct.unpack_from("!h", p, b + 34)[0], bytes(src[:6]))
             with self._lock:
-                self._v1_masters[src] = (time.monotonic(), p[b + 27], p[b + 14:b + 20])
+                self._v1_masters[src] = (time.monotonic(), key, p[b + 14:b + 20])
             if src != self._master_port:
                 return
             if p[35] & 0x08:  # PTP_ASSIST: two-step, time follows in Follow_Up
@@ -356,16 +373,61 @@ class Clock:
             self._pending_dreq.pop(next(iter(self._pending_dreq)))
 
 
-    def _v1_delay_req(self, seq: int, t3: int) -> bytes:
-        h = bytearray(124)
+    # ---- PTPv1 transmit -----------------------------------------------------
+    def _v1_header(self, length: int, event: bool, seq: int, ctrl: int, flags: int = 0) -> bytearray:
+        h = bytearray(length)
         struct.pack_into("!HH", h, 0, 1, 1)               # versionPTP 1, versionNetwork 1
         h[4:9] = b"_DFLT"                                  # subdomain
-        h[20], h[21] = 1, 1                                # event message, ethernet
+        h[20], h[21] = (1 if event else 2), 1              # event/general message, ethernet
         h[22:28] = self._v1_uuid
-        struct.pack_into("!HHB", h, 28, 1, seq, 1)         # port 1, sequence, control = Delay_Req
-        local = t3 + (self.offset_ns or 0)
-        struct.pack_into("!II", h, 40, (local // 1_000_000_000) & 0xFFFFFFFF, local % 1_000_000_000)
-        h[40 + 55] = 255                                   # local stratum: worst
+        struct.pack_into("!HHB", h, 28, 1, seq & 0xFFFF, ctrl)
+        h[35] = flags
+        return h
+
+    def _v1_sync_body(self, h: bytearray, ns: int, leader: bool):
+        """Fields shared by Sync and Delay_Req (IEEE 1588-2002 annex D)."""
+        struct.pack_into("!II", h, 40, (ns // 1_000_000_000) & 0xFFFFFFFF, ns % 1_000_000_000)
+        stratum = V1_STRATUM if leader else 255            # 255: "never a master"
+        if leader:
+            struct.pack_into("!h", h, 50, TAI_UTC_OFFSET)
+            h[53] = 1
+            h[54:60] = self._v1_uuid                       # we are grandmaster
+            struct.pack_into("!HH", h, 60, 1, self._v1_seq)
+            struct.pack_into("!H", h, 74, V1_VARIANCE)
+            struct.pack_into("!b", h, 83, V1_LOG_SYNC)
+            struct.pack_into("!H", h, 86, V1_VARIANCE)
+            h[101] = 1
+            h[102:108] = self._v1_uuid
+            struct.pack_into("!H", h, 110, 1)
+            h[123] = 1                                     # utcReasonable
+        else:
+            h[83] = 0x7F
+        h[67] = h[95] = stratum
+        h[68:72] = h[96:100] = b"DFLT"
+
+    def _send_v1_sync(self):
+        self._v1_seq = (self._v1_seq + 1) & 0xFFFF
+        h = self._v1_header(124, True, self._v1_seq, 0, flags=0x08)   # PTP_ASSIST: Follow_Up carries the time
+        t1 = self.now_ns()
+        self._v1_sync_body(h, t1, True)
+        self._send(h, EVENT_PORT)
+        fu = self._v1_header(52, False, self._v1_seq, 2)
+        struct.pack_into("!HII", fu, 42, self._v1_seq, (t1 // 1_000_000_000) & 0xFFFFFFFF, t1 % 1_000_000_000)
+        self._send(fu, GENERAL_PORT)
+
+    def _send_v1_delay_resp(self, req: bytes, rx: int):
+        t4 = rx + (self.offset_ns or 0)
+        h = self._v1_header(60, False, self._v1_seq, 3)
+        struct.pack_into("!II", h, 40, (t4 // 1_000_000_000) & 0xFFFFFFFF, t4 % 1_000_000_000)
+        h[49] = 1
+        h[50:56] = req[22:28]                              # requesting uuid, port, sequence
+        h[56:58] = req[28:30]
+        h[58:60] = req[30:32]
+        self._send(h, GENERAL_PORT)
+
+    def _v1_delay_req(self, seq: int, t3: int) -> bytes:
+        h = self._v1_header(124, True, seq, 1)
+        self._v1_sync_body(h, t3 + (self.offset_ns or 0), False)
         return bytes(h)
 
 

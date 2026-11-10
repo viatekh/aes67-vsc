@@ -47,6 +47,15 @@ class Ring:
             self.n -= count
 
 
+def fit_channels(x: np.ndarray, channels: int) -> np.ndarray:
+    """Trim extra channels or pad missing ones with silence."""
+    if x.shape[1] == channels:
+        return x
+    if x.shape[1] > channels:
+        return x[:, :channels]
+    return np.hstack([x, np.zeros((len(x), channels - x.shape[1]), np.float32)])
+
+
 def _sd():
     try:
         import sounddevice
@@ -78,14 +87,18 @@ class DeviceSource:
 
     def __init__(self, channels: int, rate: int, device=None, target_ms: float = 20):
         from .elastic import ElasticBuffer
-        self.buf = ElasticBuffer(channels, rate, int(rate * target_ms / 1000))
-        self.stream = _sd().InputStream(samplerate=rate, channels=channels, dtype="float32",
-                                        device=device, latency="low",
-                                        callback=lambda d, f, t, s: self.buf.write(d.copy()))
+        sd = _sd()
+        self.channels = channels
+        have = int(sd.query_devices(device, "input")["max_input_channels"])
+        self.dev_channels = max(1, min(channels, have))  # e.g. 8 requested on a 2-channel cable
+        self.buf = ElasticBuffer(self.dev_channels, rate, int(rate * target_ms / 1000))
+        self.stream = sd.InputStream(samplerate=rate, channels=self.dev_channels, dtype="float32",
+                                     device=device, latency="low",
+                                     callback=lambda d, f, t, s: self.buf.write(d.copy()))
         self.stream.start()
 
     def read(self, n: int) -> np.ndarray:
-        return self.buf.read(n)
+        return fit_channels(self.buf.read(n), self.channels)
 
     def close(self):
         self.stream.stop()
@@ -97,11 +110,14 @@ class DeviceSink:
 
     def __init__(self, buf, rate: int, device=None):
         self.buf = buf
+        sd = _sd()
+        have = int(sd.query_devices(device, "output")["max_output_channels"])
+        dev_channels = max(1, min(buf.channels, have))
 
         def cb(out, frames, t, status):
-            out[:] = buf.read(frames)
+            out[:] = fit_channels(buf.read(frames), dev_channels)
 
-        self.stream = _sd().OutputStream(samplerate=rate, channels=buf.channels, dtype="float32",
+        self.stream = sd.OutputStream(samplerate=rate, channels=dev_channels, dtype="float32",
                                          device=device, latency="low", callback=cb)
         self.stream.start()
 
