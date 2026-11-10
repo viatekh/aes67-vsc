@@ -38,7 +38,7 @@ Dante Controller as a regular Dante device, with TX and RX channels you route in
 - Other apps reach those channels through the virtual sound card.
 
 What works:
-- Routing in both directions, unicast and multicast flows, 16/24/32-bit, 44.1–192 kHz.
+- Routing in both directions, unicast and multicast flows, 16/24/32-bit, 44.1–96 kHz.
 - Renaming the device and its channels, changing latency and sample rate, level meters, all from Dante Controller.
 - Names and routing survive a restart, like on real devices.
 - Clock: follows the Dante network clock (PTPv1). If there is no Dante device, the app provides the clock itself,
